@@ -1,5 +1,5 @@
 [project]
-name = "mcp-relay"
+name = "relay-mcp"
 version = "0.1.0"
 description = "Minimal MCP server relay with REST API for registration"
 readme = "README.md"

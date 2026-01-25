@@ -1,4 +1,4 @@
-# MCP Relay
+# relay-mcp
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
@@ -36,7 +36,7 @@ Environment variables:
 - `HOST` - Listen host (default: `0.0.0.0`)
 - `PORT` - Listen port (default: `8000`)
 - `OTEL_EXPORTER_OTLP_ENDPOINT` - OTel collector endpoint
-- `OTEL_SERVICE_NAME` - Service name for traces (default: `mcp-relay`)
+- `OTEL_SERVICE_NAME` - Service name for traces (default: `relay-mcp`)
 
 ## Server Registration
 

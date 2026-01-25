@@ -19,7 +19,7 @@ RUN mkdir -p /data
 ENV HOST=0.0.0.0
 ENV PORT=8000
 ENV DATABASE_URL=sqlite:///data/mcp_relay.db
-ENV OTEL_SERVICE_NAME=mcp-relay
+ENV OTEL_SERVICE_NAME=relay-mcp
 
 EXPOSE 8000
 

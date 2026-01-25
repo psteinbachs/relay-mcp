@@ -37,7 +37,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-logger = logging.getLogger("mcp-relay")
+logger = logging.getLogger("relay-mcp")
 
 # Global state
 db: Optional[Database] = None
@@ -103,7 +103,7 @@ def init_telemetry():
         from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
         resource = Resource.create(
-            {SERVICE_NAME: os.getenv("OTEL_SERVICE_NAME", "mcp-relay")}
+            {SERVICE_NAME: os.getenv("OTEL_SERVICE_NAME", "relay-mcp")}
         )
         provider = TracerProvider(resource=resource)
         provider.add_span_processor(
@@ -173,7 +173,7 @@ if otel_instrumentor:
 @app.get("/health")
 async def health_check():
     """Basic health check."""
-    return {"status": "healthy", "service": "mcp-relay"}
+    return {"status": "healthy", "service": "relay-mcp"}
 
 
 @app.get("/api/stats", response_model=AggregatorStats)
@@ -571,7 +571,7 @@ async def _handle_mcp_request(
                     "tools": {"listChanged": False},
                 },
                 "serverInfo": {
-                    "name": "mcp-relay",
+                    "name": "relay-mcp",
                     "version": "0.2.0",
                 },
             }
