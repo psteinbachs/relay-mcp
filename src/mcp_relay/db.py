@@ -1,5 +1,6 @@
 """Database layer for MCP Relay - supports SQLite and PostgreSQL."""
 
+import json
 import logging
 import os
 from datetime import datetime, timezone
@@ -23,7 +24,8 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
     tools_count INTEGER DEFAULT 0,
     last_seen TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT
+    updated_at TEXT,
+    auth_config TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_mcp_servers_name ON mcp_servers(name);
@@ -43,7 +45,8 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
     tools_count INTEGER DEFAULT 0,
     last_seen TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL,
-    updated_at TIMESTAMPTZ
+    updated_at TIMESTAMPTZ,
+    auth_config TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_mcp_servers_name ON mcp_servers(name);
@@ -188,17 +191,19 @@ class Database:
         transport: str = "sse",
         description: Optional[str] = None,
         enabled: bool = True,
+        auth_config: Optional[dict] = None,
     ) -> dict:
         """Create a new server registration."""
         now = datetime.now(timezone.utc).isoformat()
         enabled_val = 1 if not self._is_postgres else enabled
+        auth_json = json.dumps(auth_config) if auth_config else None
 
         await self.execute(
             """
-            INSERT INTO mcp_servers (name, url, transport, description, enabled, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO mcp_servers (name, url, transport, description, enabled, created_at, auth_config)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (name, url, transport, description, enabled_val, now),
+            (name, url, transport, description, enabled_val, now, auth_json),
         )
         return await self.get_server(name)
 
@@ -209,6 +214,7 @@ class Database:
         transport: Optional[str] = None,
         description: Optional[str] = None,
         enabled: Optional[bool] = None,
+        auth_config: Optional[dict] = None,
     ) -> Optional[dict]:
         """Update a server registration."""
         server = await self.get_server(name)
@@ -229,6 +235,9 @@ class Database:
         if enabled is not None:
             updates.append("enabled = ?")
             params.append(1 if (not self._is_postgres and enabled) else enabled)
+        if auth_config is not None:
+            updates.append("auth_config = ?")
+            params.append(json.dumps(auth_config))
 
         if updates:
             updates.append("updated_at = ?")

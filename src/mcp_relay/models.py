@@ -23,6 +23,17 @@ class ServerStatus(str, Enum):
     UNKNOWN = "unknown"
 
 
+class AuthConfig(BaseModel):
+    """Authentication configuration for an MCP server."""
+
+    type: str = Field(..., description="Auth type: 'basic', 'bearer', or 'header'")
+    username: Optional[str] = Field(None, description="Username for basic auth")
+    password: Optional[str] = Field(None, description="Password for basic auth")
+    token: Optional[str] = Field(None, description="Token for bearer auth")
+    header_name: Optional[str] = Field(None, description="Custom header name")
+    header_value: Optional[str] = Field(None, description="Custom header value")
+
+
 class MCPServerCreate(BaseModel):
     """Request to register a new MCP server."""
 
@@ -35,6 +46,7 @@ class MCPServerCreate(BaseModel):
     )
     description: Optional[str] = Field(None, max_length=500)
     enabled: bool = Field(default=True)
+    auth: Optional[AuthConfig] = Field(None, description="Authentication config")
 
 
 class MCPServer(BaseModel):
@@ -51,6 +63,7 @@ class MCPServer(BaseModel):
     last_seen: Optional[datetime] = None
     created_at: datetime
     updated_at: Optional[datetime] = None
+    auth: Optional[AuthConfig] = None
 
 
 class MCPServerUpdate(BaseModel):
@@ -60,6 +73,7 @@ class MCPServerUpdate(BaseModel):
     transport: Optional[TransportType] = None
     description: Optional[str] = None
     enabled: Optional[bool] = None
+    auth: Optional[AuthConfig] = None
 
 
 class MCPTool(BaseModel):

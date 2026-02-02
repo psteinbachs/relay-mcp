@@ -24,6 +24,7 @@ from mcp_relay.db import Database
 from mcp_relay.discovery import DiscoveryService
 from mcp_relay.models import (
     AggregatorStats,
+    AuthConfig,
     MCPServer,
     MCPServerCreate,
     MCPServerUpdate,
@@ -292,6 +293,7 @@ async def register_server(body: MCPServerCreate):
         transport=body.transport.value,
         description=body.description,
         enabled=body.enabled,
+        auth_config=body.auth.model_dump() if body.auth else None,
     )
     logger.info(f"Registered server: {body.name} -> {body.url}")
 
@@ -319,12 +321,13 @@ async def update_server(name: str, body: MCPServerUpdate):
         transport=body.transport.value if body.transport else None,
         description=body.description,
         enabled=body.enabled,
+        auth_config=body.auth.model_dump() if body.auth else None,
     )
     if not server:
         raise HTTPException(status_code=404, detail=f"Server '{name}' not found")
 
-    # Re-discover tools if URL changed
-    if body.url:
+    # Re-discover tools if URL or auth changed
+    if body.url or body.auth:
         asyncio.create_task(discover_server_tools(name))
 
     return _db_to_server(server)
@@ -374,13 +377,17 @@ async def refresh_server_tools(name: str):
 
 @app.get("/api/tools", response_model=list[MCPTool])
 async def list_tools(server: Optional[str] = Query(None)):
-    """List all aggregated tools, optionally filtered by server."""
+    """List all aggregated tools, optionally filtered by server.
+
+    Tool names are returned in 'server__tool' format for direct use
+    with /mcp/tools/call endpoint.
+    """
     async with cache_lock:
         if server:
             tools = tool_cache.get(server, [])
             return [
                 MCPTool(
-                    name=t["name"],
+                    name=f"{server}__{t['name']}",
                     description=t.get("description"),
                     server=server,
                     input_schema=t.get("inputSchema"),
@@ -393,7 +400,7 @@ async def list_tools(server: Optional[str] = Query(None)):
             for t in tools:
                 all_tools.append(
                     MCPTool(
-                        name=t["name"],
+                        name=f"{srv_name}__{t['name']}",
                         description=t.get("description"),
                         server=srv_name,
                         input_schema=t.get("inputSchema"),
@@ -588,12 +595,22 @@ async def _handle_mcp_request(
             tool_name = params.get("name", "")
             arguments = params.get("arguments", {})
 
-            if "__" not in tool_name:
-                raise ValueError(
-                    f"Tool name must be in format 'server__tool': {tool_name}"
-                )
-
-            server_name, actual_tool = tool_name.split("__", 1)
+            if "__" in tool_name:
+                server_name, actual_tool = tool_name.split("__", 1)
+            else:
+                # Auto-lookup: find which server owns this tool
+                actual_tool = tool_name
+                server_name = None
+                async with cache_lock:
+                    for srv_name, tools in tool_cache.items():
+                        for t in tools:
+                            if t["name"] == tool_name:
+                                server_name = srv_name
+                                break
+                        if server_name:
+                            break
+                if not server_name:
+                    raise ValueError(f"Tool '{tool_name}' not found in any server")
             server = await db.get_server(server_name)
             if not server:
                 raise ValueError(f"Server '{server_name}' not found")
@@ -730,13 +747,25 @@ async def call_tool(request: Request):
     tool_name = body.get("name", "")
     arguments = body.get("arguments", {})
 
-    # Parse server__tool format
-    if "__" not in tool_name:
-        raise HTTPException(
-            status_code=400, detail="Tool name must be in format 'server__tool'"
-        )
-
-    server_name, actual_tool = tool_name.split("__", 1)
+    # Parse server__tool format or auto-lookup
+    if "__" in tool_name:
+        server_name, actual_tool = tool_name.split("__", 1)
+    else:
+        # Auto-lookup: find which server owns this tool
+        actual_tool = tool_name
+        server_name = None
+        async with cache_lock:
+            for srv_name, tools in tool_cache.items():
+                for t in tools:
+                    if t["name"] == tool_name:
+                        server_name = srv_name
+                        break
+                if server_name:
+                    break
+        if not server_name:
+            raise HTTPException(
+                status_code=404, detail=f"Tool '{tool_name}' not found in any server"
+            )
 
     server = await db.get_server(server_name)
     if not server:
@@ -869,8 +898,46 @@ async def send_canary_alert(result: ServerHealth, previous: ServerStatus):
 # =============================================================================
 
 
+def _parse_auth_config(auth_json: Optional[str]) -> Optional[dict]:
+    """Parse auth_config JSON from database."""
+    if not auth_json:
+        return None
+    try:
+        return json.loads(auth_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _build_auth_headers(auth_config: Optional[dict]) -> dict[str, str]:
+    """Build HTTP headers from auth config."""
+    if not auth_config:
+        return {}
+
+    auth_type = auth_config.get("type", "").lower()
+    headers = {}
+
+    if auth_type == "basic":
+        import base64
+
+        username = auth_config.get("username", "")
+        password = auth_config.get("password", "")
+        credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
+        headers["Authorization"] = f"Basic {credentials}"
+    elif auth_type == "bearer":
+        token = auth_config.get("token", "")
+        headers["Authorization"] = f"Bearer {token}"
+    elif auth_type == "header":
+        header_name = auth_config.get("header_name")
+        header_value = auth_config.get("header_value")
+        if header_name and header_value:
+            headers[header_name] = header_value
+
+    return headers
+
+
 def _db_to_server(row: dict) -> MCPServer:
     """Convert database row to MCPServer model."""
+    auth_config = _parse_auth_config(row.get("auth_config"))
     return MCPServer(
         id=row["id"],
         name=row["name"],
@@ -887,6 +954,7 @@ def _db_to_server(row: dict) -> MCPServer:
         updated_at=datetime.fromisoformat(row["updated_at"])
         if row.get("updated_at")
         else None,
+        auth=AuthConfig(**auth_config) if auth_config else None,
     )
 
 
@@ -895,10 +963,13 @@ async def probe_server(server: dict) -> ServerHealth:
     name = server["name"]
     url = server["url"]
     transport = server.get("transport", "sse")
+    auth_config = _parse_auth_config(server.get("auth_config"))
     start = time.time()
 
     try:
-        tools = await _fetch_tools_from_server(url, transport, timeout=10)
+        tools = await _fetch_tools_from_server(
+            url, transport, timeout=10, auth_config=auth_config
+        )
         latency_ms = (time.time() - start) * 1000
 
         await db.update_server_status(name, "healthy", len(tools))
@@ -929,11 +1000,14 @@ async def discover_server_tools(name: str) -> list[dict]:
     if not server or not server.get("enabled"):
         return []
 
+    auth_config = _parse_auth_config(server.get("auth_config"))
+
     try:
         tools = await _fetch_tools_from_server(
             server["url"],
             server.get("transport", "sse"),
             timeout=30,
+            auth_config=auth_config,
         )
         async with cache_lock:
             tool_cache[name] = tools
@@ -981,13 +1055,13 @@ async def refresh_all_tools(retry_on_empty: bool = False, max_retries: int = 3):
 
 
 async def _fetch_tools_from_server(
-    url: str, transport: str, timeout: int = 30
+    url: str, transport: str, timeout: int = 30, auth_config: Optional[dict] = None
 ) -> list[dict]:
     """Fetch tools list from an MCP server."""
     if transport == "sse":
         return await _fetch_tools_sse(url, timeout)
     elif transport == "http":
-        return await _fetch_tools_http(url, timeout)
+        return await _fetch_tools_http(url, timeout, auth_config)
     else:
         raise ValueError(f"Unsupported transport: {transport}")
 
@@ -1008,10 +1082,17 @@ async def _fetch_tools_sse(url: str, timeout: int) -> list[dict]:
             ]
 
 
-async def _fetch_tools_http(url: str, timeout: int) -> list[dict]:
+async def _fetch_tools_http(
+    url: str, timeout: int, auth_config: Optional[dict] = None
+) -> list[dict]:
     """Fetch tools from streamable-http server."""
     try:
-        async with streamablehttp_client(url) as (read_stream, write_stream, _):
+        headers = _build_auth_headers(auth_config)
+        async with streamablehttp_client(url, headers=headers) as (
+            read_stream,
+            write_stream,
+            _,
+        ):
             async with ClientSession(read_stream, write_stream) as session:
                 await session.initialize()
                 result = await session.list_tools()
@@ -1058,6 +1139,7 @@ async def execute_tool_on_server(server: dict, tool_name: str, arguments: dict) 
     """Execute a tool on a specific server."""
     url = server["url"]
     transport = server.get("transport", "sse")
+    auth_config = _parse_auth_config(server.get("auth_config"))
 
     # Normalize argument keys (snake_case -> camelCase)
     arguments = _normalize_arguments(arguments)
@@ -1072,7 +1154,12 @@ async def execute_tool_on_server(server: dict, tool_name: str, arguments: dict) 
                     "content": [c.model_dump(exclude_none=True) for c in result.content]
                 }
     elif transport == "http":
-        async with streamablehttp_client(url) as (read_stream, write_stream, _):
+        headers = _build_auth_headers(auth_config)
+        async with streamablehttp_client(url, headers=headers) as (
+            read_stream,
+            write_stream,
+            _,
+        ):
             async with ClientSession(read_stream, write_stream) as session:
                 await session.initialize()
                 result = await session.call_tool(tool_name, arguments)
