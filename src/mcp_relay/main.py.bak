@@ -1119,12 +1119,20 @@ def _snake_to_camel(name: str) -> str:
 
 
 def _normalize_arguments(arguments: dict) -> dict:
-    """Pass through arguments unchanged.
+    """Normalize argument keys from snake_case to camelCase.
 
-    Previously converted snake_case to camelCase, but this breaks
-    Python-based MCP servers (like mcp-atlassian) that use snake_case.
+    LLMs trained on Python often emit snake_case parameter names,
+    but JavaScript-based MCP servers expect camelCase.
     """
-    return arguments
+    normalized = {}
+    for key, value in arguments.items():
+        # Convert snake_case to camelCase
+        if "_" in key:
+            camel_key = _snake_to_camel(key)
+            normalized[camel_key] = value
+        else:
+            normalized[key] = value
+    return normalized
 
 
 async def execute_tool_on_server(server: dict, tool_name: str, arguments: dict) -> dict:
