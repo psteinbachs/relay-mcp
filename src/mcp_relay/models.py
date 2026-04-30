@@ -4,7 +4,35 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+def _validate_tool_list(v: Optional[list[str]]) -> Optional[list[str]]:
+    """Normalize a tool allowlist/blocklist: strip whitespace,
+    drop empties, dedupe in original order, reject non-strings.
+
+    Empty list (after normalization) is preserved as an explicit
+    choice — distinct from None (no filter set). Whitespace-only
+    entries collapse to nothing and are dropped, NOT preserved as
+    "" — empty tool names can't match any real tool, so they'd
+    create silent dead filters.
+    """
+    if v is None:
+        return None
+    seen: set[str] = set()
+    out: list[str] = []
+    for entry in v:
+        if not isinstance(entry, str):
+            raise ValueError(
+                f"tool list entries must be strings, got {type(entry).__name__}"
+            )
+        cleaned = entry.strip()
+        if not cleaned:
+            continue
+        if cleaned not in seen:
+            seen.add(cleaned)
+            out.append(cleaned)
+    return out
 
 
 class TransportType(str, Enum):
@@ -47,6 +75,26 @@ class MCPServerCreate(BaseModel):
     description: Optional[str] = Field(None, max_length=500)
     enabled: bool = Field(default=True)
     auth: Optional[AuthConfig] = Field(None, description="Authentication config")
+    tool_allowlist: Optional[list[str]] = Field(
+        None,
+        description=(
+            "If set, only these tool names (the server's local names, not "
+            "the prefixed `server__tool` form) are exposed to clients. "
+            "Use to whitelist a small set of safe tools from a permissive "
+            "upstream MCP. Combine with tool_blocklist for defense-in-depth."
+        ),
+    )
+    tool_blocklist: Optional[list[str]] = Field(
+        None,
+        description=(
+            "If set, these tool names (local) are hidden from clients and "
+            "tools/call invocations are rejected. Use to suppress dangerous "
+            "tools while keeping the rest of the upstream surface."
+        ),
+    )
+
+    _validate_allowlist = field_validator("tool_allowlist")(_validate_tool_list)
+    _validate_blocklist = field_validator("tool_blocklist")(_validate_tool_list)
 
 
 class MCPServer(BaseModel):
@@ -64,16 +112,41 @@ class MCPServer(BaseModel):
     created_at: datetime
     updated_at: Optional[datetime] = None
     auth: Optional[AuthConfig] = None
+    tool_allowlist: Optional[list[str]] = None
+    tool_blocklist: Optional[list[str]] = None
 
 
 class MCPServerUpdate(BaseModel):
-    """Request to update an MCP server."""
+    """Request to update an MCP server.
+
+    Field semantics: omit a field to leave it unchanged. Pydantic +
+    JSON cannot distinguish "field omitted" from "field explicitly
+    null" — both arrive as ``None`` — so this API treats both
+    identically as 'no change'. To explicitly CLEAR
+    ``tool_allowlist`` / ``tool_blocklist`` (revert to no-filtering
+    on that side), set the matching ``clear_*`` flag. Forcing the
+    operator to opt in via a separate flag prevents a routine
+    description-only PATCH from silently stripping safety filtering.
+    """
 
     url: Optional[str] = None
     transport: Optional[TransportType] = None
     description: Optional[str] = None
     enabled: Optional[bool] = None
     auth: Optional[AuthConfig] = None
+    tool_allowlist: Optional[list[str]] = None
+    tool_blocklist: Optional[list[str]] = None
+    clear_tool_allowlist: bool = Field(
+        default=False,
+        description="Set true to clear an existing allowlist (revert to no-allowlist filtering).",
+    )
+    clear_tool_blocklist: bool = Field(
+        default=False,
+        description="Set true to clear an existing blocklist.",
+    )
+
+    _validate_allowlist = field_validator("tool_allowlist")(_validate_tool_list)
+    _validate_blocklist = field_validator("tool_blocklist")(_validate_tool_list)
 
 
 class MCPTool(BaseModel):

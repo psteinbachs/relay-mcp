@@ -25,7 +25,9 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
     last_seen TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT,
-    auth_config TEXT
+    auth_config TEXT,
+    tool_allowlist TEXT,
+    tool_blocklist TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_mcp_servers_name ON mcp_servers(name);
@@ -46,7 +48,9 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
     last_seen TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ,
-    auth_config TEXT
+    auth_config TEXT,
+    tool_allowlist TEXT,
+    tool_blocklist TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_mcp_servers_name ON mcp_servers(name);
@@ -116,12 +120,42 @@ class Database:
             await self._conn.close()
 
     async def init_schema(self) -> None:
-        """Initialize database schema."""
+        """Initialize database schema.
+
+        After creating the table from scratch (no-op on existing
+        deploys), idempotently ALTER ADD COLUMN any fields that were
+        introduced after the original table shipped — older deployments
+        will be missing them, and we don't want to require a manual
+        migration step. SQLite and Postgres both support
+        ``ADD COLUMN IF NOT EXISTS``.
+        """
         if self._is_postgres:
             async with self._pool.acquire() as conn:
                 await conn.execute(SCHEMA_PG)
+                # Migrations for fields added post-initial-release.
+                await conn.execute(
+                    "ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS tool_allowlist TEXT"
+                )
+                await conn.execute(
+                    "ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS tool_blocklist TEXT"
+                )
         else:
             await self._conn.executescript(SCHEMA)
+            # SQLite gained `ADD COLUMN IF NOT EXISTS` in 3.35; older
+            # versions still ship in some distros. Probe pragma and skip
+            # silently if the column already exists.
+            existing = {
+                row["name"]
+                for row in await self.fetchall("PRAGMA table_info(mcp_servers)")
+            }
+            if "tool_allowlist" not in existing:
+                await self._conn.execute(
+                    "ALTER TABLE mcp_servers ADD COLUMN tool_allowlist TEXT"
+                )
+            if "tool_blocklist" not in existing:
+                await self._conn.execute(
+                    "ALTER TABLE mcp_servers ADD COLUMN tool_blocklist TEXT"
+                )
             await self._conn.commit()
         logger.info("Database schema initialized")
 
@@ -192,18 +226,25 @@ class Database:
         description: Optional[str] = None,
         enabled: bool = True,
         auth_config: Optional[dict] = None,
+        tool_allowlist: Optional[list[str]] = None,
+        tool_blocklist: Optional[list[str]] = None,
     ) -> dict:
         """Create a new server registration."""
         now = datetime.now(timezone.utc).isoformat()
         enabled_val = 1 if not self._is_postgres else enabled
         auth_json = json.dumps(auth_config) if auth_config else None
+        allow_json = json.dumps(tool_allowlist) if tool_allowlist is not None else None
+        block_json = json.dumps(tool_blocklist) if tool_blocklist is not None else None
 
         await self.execute(
             """
-            INSERT INTO mcp_servers (name, url, transport, description, enabled, created_at, auth_config)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO mcp_servers (name, url, transport, description, enabled, created_at, auth_config, tool_allowlist, tool_blocklist)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (name, url, transport, description, enabled_val, now, auth_json),
+            (
+                name, url, transport, description, enabled_val, now,
+                auth_json, allow_json, block_json,
+            ),
         )
         return await self.get_server(name)
 
@@ -215,8 +256,19 @@ class Database:
         description: Optional[str] = None,
         enabled: Optional[bool] = None,
         auth_config: Optional[dict] = None,
+        tool_allowlist: Optional[list[str]] = None,
+        tool_blocklist: Optional[list[str]] = None,
+        clear_tool_allowlist: bool = False,
+        clear_tool_blocklist: bool = False,
     ) -> Optional[dict]:
-        """Update a server registration."""
+        """Update a server registration.
+
+        ``tool_allowlist`` / ``tool_blocklist``: pass a list to set;
+        leave None to skip. To clear an existing list (revert to
+        no-filtering behavior on that side), pass the matching
+        ``clear_*`` flag — None alone is "leave unchanged" so that
+        callers can update one field without nuking the other.
+        """
         server = await self.get_server(name)
         if not server:
             return None
@@ -238,6 +290,18 @@ class Database:
         if auth_config is not None:
             updates.append("auth_config = ?")
             params.append(json.dumps(auth_config))
+        if tool_allowlist is not None:
+            updates.append("tool_allowlist = ?")
+            params.append(json.dumps(tool_allowlist))
+        elif clear_tool_allowlist:
+            updates.append("tool_allowlist = ?")
+            params.append(None)
+        if tool_blocklist is not None:
+            updates.append("tool_blocklist = ?")
+            params.append(json.dumps(tool_blocklist))
+        elif clear_tool_blocklist:
+            updates.append("tool_blocklist = ?")
+            params.append(None)
 
         if updates:
             updates.append("updated_at = ?")

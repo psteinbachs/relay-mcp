@@ -294,7 +294,10 @@ async def register_server(body: MCPServerCreate):
         description=body.description,
         enabled=body.enabled,
         auth_config=body.auth.model_dump() if body.auth else None,
+        tool_allowlist=body.tool_allowlist,
+        tool_blocklist=body.tool_blocklist,
     )
+    _invalidate_filter_cache(body.name)
     logger.info(f"Registered server: {body.name} -> {body.url}")
 
     # Trigger async tool discovery
@@ -322,9 +325,15 @@ async def update_server(name: str, body: MCPServerUpdate):
         description=body.description,
         enabled=body.enabled,
         auth_config=body.auth.model_dump() if body.auth else None,
+        tool_allowlist=body.tool_allowlist,
+        tool_blocklist=body.tool_blocklist,
+        clear_tool_allowlist=body.clear_tool_allowlist,
+        clear_tool_blocklist=body.clear_tool_blocklist,
     )
     if not server:
         raise HTTPException(status_code=404, detail=f"Server '{name}' not found")
+
+    _invalidate_filter_cache(name)
 
     # Re-discover tools if URL or auth changed
     if body.url or body.auth:
@@ -343,6 +352,7 @@ async def unregister_server(name: str):
     # Clear tool cache
     async with cache_lock:
         tool_cache.pop(name, None)
+    _invalidate_filter_cache(name)
 
     logger.info(f"Unregistered server: {name}")
     return {"deleted": True, "name": name}
@@ -380,10 +390,12 @@ async def list_tools(server: Optional[str] = Query(None)):
     """List all aggregated tools, optionally filtered by server.
 
     Tool names are returned in 'server__tool' format for direct use
-    with /mcp/tools/call endpoint.
+    with /mcp/tools/call endpoint. Per-server allow/block lists, if
+    set, hide non-permitted tools from the response.
     """
     async with cache_lock:
         if server:
+            allow, block = await _server_filters(server)
             tools = tool_cache.get(server, [])
             return [
                 MCPTool(
@@ -393,11 +405,15 @@ async def list_tools(server: Optional[str] = Query(None)):
                     input_schema=t.get("inputSchema"),
                 )
                 for t in tools
+                if _is_tool_allowed(t["name"], allow, block)
             ]
 
         all_tools = []
         for srv_name, tools in tool_cache.items():
+            allow, block = await _server_filters(srv_name)
             for t in tools:
+                if not _is_tool_allowed(t["name"], allow, block):
+                    continue
                 all_tools.append(
                     MCPTool(
                         name=f"{srv_name}__{t['name']}",
@@ -470,11 +486,16 @@ async def discover_tools(request: Request):
     if not query:
         raise HTTPException(status_code=400, detail="Query is required")
 
-    # Get all tools from cache
+    # Get all tools from cache, dropping anything filtered out by
+    # per-server allow/block lists so semantic search can't surface a
+    # tool that won't be invokable anyway.
     async with cache_lock:
         all_tools = []
         for srv_name, tools in tool_cache.items():
+            allow, block = await _server_filters(srv_name)
             for t in tools:
+                if not _is_tool_allowed(t["name"], allow, block):
+                    continue
                 all_tools.append(
                     {
                         "name": t["name"],
@@ -531,6 +552,16 @@ async def execute_tool(request: Request):
     if not server:
         raise HTTPException(status_code=404, detail=f"Server '{server_name}' not found")
 
+    allow, block = await _server_filters(server_name)
+    if not _is_tool_allowed(tool_name, allow, block):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Tool '{tool_name}' on server '{server_name}' is not in "
+                "this server's allowlist or is blocked"
+            ),
+        )
+
     try:
         result = await execute_tool_on_server(server, tool_name, arguments)
         return {"result": result}
@@ -544,11 +575,17 @@ async def execute_tool(request: Request):
 # =============================================================================
 
 
-def _get_aggregated_tools() -> list[dict[str, Any]]:
-    """Get all tools from cache in MCP format."""
+async def _get_aggregated_tools() -> list[dict[str, Any]]:
+    """Get all tools from cache in MCP format, with per-server
+    allow/block lists applied so MCP clients (e.g. Claude Code) only
+    see invokable tools.
+    """
     all_tools = []
     for srv_name, tools in tool_cache.items():
+        allow, block = await _server_filters(srv_name)
         for t in tools:
+            if not _is_tool_allowed(t["name"], allow, block):
+                continue
             all_tools.append(
                 {
                     "name": f"{srv_name}__{t['name']}",
@@ -588,7 +625,7 @@ async def _handle_mcp_request(
         elif method == "tools/list":
             # Return aggregated tools
             async with cache_lock:
-                tools = _get_aggregated_tools()
+                tools = await _get_aggregated_tools()
             result = {"tools": tools}
         elif method == "tools/call":
             # Execute a tool
@@ -615,6 +652,17 @@ async def _handle_mcp_request(
             if not server:
                 raise ValueError(f"Server '{server_name}' not found")
 
+            # Enforce allow/block list at the call site too — even if
+            # a stale client cached the tool from before a filter was
+            # tightened, the call must be rejected. Same name check
+            # as tool listing (local name, no prefix).
+            allow, block = await _server_filters(server_name)
+            if not _is_tool_allowed(actual_tool, allow, block):
+                raise PolicyDenied(
+                    f"Tool '{actual_tool}' on server '{server_name}' is "
+                    "not in this server's allowlist or is blocked"
+                )
+
             tool_result = await execute_tool_on_server(server, actual_tool, arguments)
             result = tool_result
         elif method == "ping":
@@ -636,6 +684,19 @@ async def _handle_mcp_request(
             "result": result,
         }
 
+    except PolicyDenied as e:
+        # Distinct error code so clients can react to policy denials
+        # (e.g. "tool not available — try a different approach")
+        # without conflating with internal server errors.
+        logger.info(f"MCP request denied by policy: {method}: {e}")
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {
+                "code": JSONRPC_POLICY_DENIED_CODE,
+                "message": str(e),
+            },
+        }
     except Exception as e:
         logger.error(f"MCP request error: {method}: {e}")
         return {
@@ -770,6 +831,20 @@ async def call_tool(request: Request):
     server = await db.get_server(server_name)
     if not server:
         raise HTTPException(status_code=404, detail=f"Server '{server_name}' not found")
+
+    # Per-server allow/block list enforcement. 403 distinguishes
+    # "policy denial" from "tool not found" so callers can retry-or-
+    # adjust appropriately rather than treating it as a routing
+    # error.
+    allow, block = await _server_filters(server_name)
+    if not _is_tool_allowed(actual_tool, allow, block):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Tool '{actual_tool}' on server '{server_name}' is not "
+                "in this server's allowlist or is blocked"
+            ),
+        )
 
     # Call the tool on the target server
     result = await execute_tool_on_server(server, actual_tool, arguments)
@@ -935,6 +1010,64 @@ def _build_auth_headers(auth_config: Optional[dict]) -> dict[str, str]:
     return headers
 
 
+class PolicyDenied(Exception):
+    """Raised when a tool call is rejected by per-server allow/block
+    list policy. Mapped to JSON-RPC error code -32001 (server-defined,
+    in the implementation-defined -32000..-32099 range) so MCP clients
+    can distinguish a policy denial from a generic internal error."""
+
+
+# JSON-RPC error code for "tool blocked by policy". Implementation-
+# defined per JSON-RPC 2.0 §5.1 (servers may use any code in the
+# -32000..-32099 range).
+JSONRPC_POLICY_DENIED_CODE = -32001
+
+
+def _parse_tool_list(raw: Any) -> Optional[list[str]]:
+    """Parse a tool_allowlist / tool_blocklist column value.
+
+    Stored as JSON text in the DB; ``None`` (column NULL) means
+    "no filter on this side". Empty list is an explicit choice
+    (allowlist=[] = no tools visible; blocklist=[] = no tools
+    blocked) and is preserved as-is.
+
+    On corruption (non-JSON, non-array JSON, etc.) we log a loud
+    warning and return ``None`` — fail-open on the parse error
+    rather than fail-closed, since a stuck-blocking-everything
+    state from a single bad row could lock out an entire server's
+    tool surface. Operators MUST monitor logs for this warning;
+    the saved server config is broken until a valid PATCH replaces
+    the malformed list.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, list):
+        return raw
+    if not isinstance(raw, str):
+        logger.warning(
+            "tool_allowlist/blocklist column has unexpected type %s; treating as no-filter",
+            type(raw).__name__,
+        )
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        logger.warning(
+            "tool_allowlist/blocklist column contains invalid JSON (%s); "
+            "treating as no-filter — REPAIR REQUIRED",
+            e,
+        )
+        return None
+    if not isinstance(parsed, list):
+        logger.warning(
+            "tool_allowlist/blocklist column JSON is %s, not a list; "
+            "treating as no-filter — REPAIR REQUIRED",
+            type(parsed).__name__,
+        )
+        return None
+    return parsed
+
+
 def _db_to_server(row: dict) -> MCPServer:
     """Convert database row to MCPServer model."""
     auth_config = _parse_auth_config(row.get("auth_config"))
@@ -955,7 +1088,72 @@ def _db_to_server(row: dict) -> MCPServer:
         if row.get("updated_at")
         else None,
         auth=AuthConfig(**auth_config) if auth_config else None,
+        tool_allowlist=_parse_tool_list(row.get("tool_allowlist")),
+        tool_blocklist=_parse_tool_list(row.get("tool_blocklist")),
     )
+
+
+def _is_tool_allowed(
+    tool_name: str,
+    allowlist: Optional[list[str]],
+    blocklist: Optional[list[str]],
+) -> bool:
+    """Decide whether a tool (local name, no ``server__`` prefix) is
+    visible / callable through the relay.
+
+    A tool passes iff:
+      * allowlist is None OR tool in allowlist, AND
+      * blocklist is None OR tool not in blocklist.
+
+    Both lists optional and independent — set both for
+    defense-in-depth (allowlist your intended set, blocklist defends
+    against new dangerous tools added by an upstream MCP). With
+    neither set the relay behaves exactly as before.
+    """
+    if allowlist is not None and tool_name not in allowlist:
+        return False
+    if blocklist is not None and tool_name in blocklist:
+        return False
+    return True
+
+
+# Cache of (allowlist, blocklist) keyed by server name. Refreshed
+# lazily — we read on the registration / update API path and on
+# canary-loop refresh, so the cache stays in sync with the DB.
+_filter_cache: dict[str, tuple[Optional[list[str]], Optional[list[str]]]] = {}
+
+
+async def _server_filters(
+    server_name: str,
+) -> tuple[Optional[list[str]], Optional[list[str]]]:
+    """Return ``(allowlist, blocklist)`` for a server, hitting the DB
+    lazily and caching the answer. Returns ``(None, None)`` for
+    unknown servers — same behavior as never-set, i.e. no filtering.
+    """
+    cached = _filter_cache.get(server_name)
+    if cached is not None:
+        return cached
+    row = await db.get_server(server_name)
+    if row is None:
+        return (None, None)
+    pair = (
+        _parse_tool_list(row.get("tool_allowlist")),
+        _parse_tool_list(row.get("tool_blocklist")),
+    )
+    _filter_cache[server_name] = pair
+    return pair
+
+
+def _invalidate_filter_cache(server_name: Optional[str] = None) -> None:
+    """Drop a single server (or the whole cache) from the filter
+    cache. Called whenever a server is registered, updated, or
+    deleted so subsequent tool-list / tool-call requests see the
+    fresh filter state.
+    """
+    if server_name is None:
+        _filter_cache.clear()
+    else:
+        _filter_cache.pop(server_name, None)
 
 
 async def probe_server(server: dict) -> ServerHealth:
