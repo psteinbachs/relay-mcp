@@ -298,6 +298,227 @@ async def test_resources_read_with_null_params_returns_clean_error(populated_db)
 # -- Snapshot completeness: zero-tool / un-cached servers --
 
 
+# -- Sub-server detection (relay-of-relay topologies) --
+
+
+async def test_sub_servers_surface_when_tools_have_multiple_prefixes(
+    tmp_path, monkeypatch
+):
+    """When this relay federates another aggregator, the federated
+    upstream's tool names follow ``<sub-prefix>__<tool>``. The
+    capability snapshot must surface that breakdown so an agent
+    sees, e.g., 'docs-mcp: 5 tools' rather than only the
+    alphabetically-first sub-prefix in a flat sample of 10.
+    """
+    db_path = tmp_path / "subprefix.db"
+    test_db = Database(database_url=f"sqlite:///{db_path}")
+    await test_db.connect()
+    await test_db.init_schema()
+    await test_db.create_server(
+        name="alloy",
+        url="http://example/sse",
+        description="Federated upstream aggregator",
+    )
+    await test_db.update_server_status("alloy", "healthy", tools_count=4)
+
+    monkeypatch.setattr(relay_main, "db", test_db)
+    monkeypatch.setitem(
+        relay_main.tool_cache,
+        "alloy",
+        [
+            {"name": "alloy-mcp__list_orders", "description": "", "inputSchema": {}},
+            {"name": "alloy-mcp__cancel_order", "description": "", "inputSchema": {}},
+            {"name": "docs-mcp__context_search", "description": "", "inputSchema": {}},
+            {"name": "docs-mcp__context_index", "description": "", "inputSchema": {}},
+        ],
+    )
+    relay_main._invalidate_filter_cache()
+
+    transport = ASGITransport(app=relay_main.app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as c:
+        response = await c.post(
+            "/api/resources/read", json={"uri": "gateway://capabilities"}
+        )
+        body = json.loads(response.json()["contents"][0]["text"])
+
+    alloy = next(s for s in body["servers"] if s["server"] == "alloy")
+    assert "sub_servers" in alloy
+    by_prefix = {sub["prefix"]: sub for sub in alloy["sub_servers"]}
+    assert set(by_prefix) == {"alloy-mcp", "docs-mcp"}
+
+    docs = by_prefix["docs-mcp"]
+    assert docs["tool_count"] == 2
+    assert docs["tool_prefix"] == "alloy__docs-mcp__"
+    # Local sample names — the prefix is stripped so the agent sees
+    # the actual tool names; the full invocation form is built from
+    # tool_prefix.
+    assert set(docs["sample_tools"]) == {"context_index", "context_search"}
+
+    relay_main.tool_cache.pop("alloy", None)
+    relay_main._invalidate_filter_cache()
+    await test_db.close()
+
+
+async def test_sub_servers_omitted_when_only_one_sub_prefix(tmp_path, monkeypatch):
+    """A server with exactly one ``__``-prefixed group adds no
+    information over the flat ``sample_tools`` list. Including
+    ``sub_servers`` would just be noise."""
+    db_path = tmp_path / "single.db"
+    test_db = Database(database_url=f"sqlite:///{db_path}")
+    await test_db.connect()
+    await test_db.init_schema()
+    await test_db.create_server(name="upstream", url="http://example/sse")
+
+    monkeypatch.setattr(relay_main, "db", test_db)
+    monkeypatch.setitem(
+        relay_main.tool_cache,
+        "upstream",
+        [
+            {"name": "weather__forecast", "description": "", "inputSchema": {}},
+            {"name": "weather__current", "description": "", "inputSchema": {}},
+        ],
+    )
+    relay_main._invalidate_filter_cache()
+
+    transport = ASGITransport(app=relay_main.app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as c:
+        response = await c.post(
+            "/api/resources/read", json={"uri": "gateway://capabilities"}
+        )
+        body = json.loads(response.json()["contents"][0]["text"])
+    upstream = next(s for s in body["servers"] if s["server"] == "upstream")
+    assert "sub_servers" not in upstream
+
+    relay_main.tool_cache.pop("upstream", None)
+    relay_main._invalidate_filter_cache()
+    await test_db.close()
+
+
+async def test_sub_servers_omitted_when_no_double_underscores(tmp_path, monkeypatch):
+    """A flat server (tools with no ``__`` in their names) must
+    not get a ``sub_servers`` field — the heuristic should only fire
+    for genuine relay-of-relay topologies."""
+    db_path = tmp_path / "flat.db"
+    test_db = Database(database_url=f"sqlite:///{db_path}")
+    await test_db.connect()
+    await test_db.init_schema()
+    await test_db.create_server(name="weather", url="http://example/sse")
+
+    monkeypatch.setattr(relay_main, "db", test_db)
+    monkeypatch.setitem(
+        relay_main.tool_cache,
+        "weather",
+        [
+            {"name": "get_forecast", "description": "", "inputSchema": {}},
+            {"name": "get_current", "description": "", "inputSchema": {}},
+        ],
+    )
+    relay_main._invalidate_filter_cache()
+
+    transport = ASGITransport(app=relay_main.app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as c:
+        response = await c.post(
+            "/api/resources/read", json={"uri": "gateway://capabilities"}
+        )
+        body = json.loads(response.json()["contents"][0]["text"])
+    weather = next(s for s in body["servers"] if s["server"] == "weather")
+    assert "sub_servers" not in weather
+
+    relay_main.tool_cache.pop("weather", None)
+    relay_main._invalidate_filter_cache()
+    await test_db.close()
+
+
+async def test_sub_servers_count_reconciles_with_server_total(tmp_path, monkeypatch):
+    """``sum(sub.tool_count) == server.tool_count``. Drift here
+    means a tool was double-counted or dropped during partitioning,
+    and the agent's mental model of the surface goes wrong."""
+    db_path = tmp_path / "reconcile.db"
+    test_db = Database(database_url=f"sqlite:///{db_path}")
+    await test_db.connect()
+    await test_db.init_schema()
+    await test_db.create_server(name="alloy", url="http://example/sse")
+
+    monkeypatch.setattr(relay_main, "db", test_db)
+    monkeypatch.setitem(
+        relay_main.tool_cache,
+        "alloy",
+        [
+            {"name": "a__one", "description": "", "inputSchema": {}},
+            {"name": "a__two", "description": "", "inputSchema": {}},
+            {"name": "b__one", "description": "", "inputSchema": {}},
+            {"name": "c__one", "description": "", "inputSchema": {}},
+            {"name": "c__two", "description": "", "inputSchema": {}},
+            {"name": "c__three", "description": "", "inputSchema": {}},
+        ],
+    )
+    relay_main._invalidate_filter_cache()
+
+    transport = ASGITransport(app=relay_main.app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as c:
+        response = await c.post(
+            "/api/resources/read", json={"uri": "gateway://capabilities"}
+        )
+        body = json.loads(response.json()["contents"][0]["text"])
+    alloy = next(s for s in body["servers"] if s["server"] == "alloy")
+    assert alloy["tool_count"] == 6
+    assert sum(sub["tool_count"] for sub in alloy["sub_servers"]) == 6
+    assert {sub["prefix"] for sub in alloy["sub_servers"]} == {"a", "b", "c"}
+
+    relay_main.tool_cache.pop("alloy", None)
+    relay_main._invalidate_filter_cache()
+    await test_db.close()
+
+
+async def test_sub_servers_handles_mixed_prefixed_and_flat_tools(
+    tmp_path, monkeypatch
+):
+    """Some upstream aggregators expose a mix: some tools follow the
+    ``__``-prefixed convention, some don't. The unprefixed tools
+    must still be counted under a stable bucket so they're not
+    silently dropped from the snapshot."""
+    db_path = tmp_path / "mixed.db"
+    test_db = Database(database_url=f"sqlite:///{db_path}")
+    await test_db.connect()
+    await test_db.init_schema()
+    await test_db.create_server(name="upstream", url="http://example/sse")
+
+    monkeypatch.setattr(relay_main, "db", test_db)
+    monkeypatch.setitem(
+        relay_main.tool_cache,
+        "upstream",
+        [
+            {"name": "docs__search", "description": "", "inputSchema": {}},
+            {"name": "docs__index", "description": "", "inputSchema": {}},
+            {"name": "ping", "description": "", "inputSchema": {}},
+            {"name": "health", "description": "", "inputSchema": {}},
+        ],
+    )
+    relay_main._invalidate_filter_cache()
+
+    transport = ASGITransport(app=relay_main.app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as c:
+        response = await c.post(
+            "/api/resources/read", json={"uri": "gateway://capabilities"}
+        )
+        body = json.loads(response.json()["contents"][0]["text"])
+    upstream = next(s for s in body["servers"] if s["server"] == "upstream")
+    assert sum(sub["tool_count"] for sub in upstream["sub_servers"]) == 4
+    by_prefix = {sub["prefix"]: sub for sub in upstream["sub_servers"]}
+    assert set(by_prefix) == {"docs", ""}
+    flat = by_prefix[""]
+    assert flat["tool_count"] == 2
+    assert set(flat["sample_tools"]) == {"health", "ping"}
+    # The flat bucket's invocation prefix is the server's own prefix
+    # (no sub-segment), so the agent doesn't try to inject an empty
+    # path component.
+    assert flat["tool_prefix"] == "upstream__"
+
+    relay_main.tool_cache.pop("upstream", None)
+    relay_main._invalidate_filter_cache()
+    await test_db.close()
+
+
 async def test_capabilities_includes_registered_server_without_cached_tools(
     tmp_path, monkeypatch
 ):

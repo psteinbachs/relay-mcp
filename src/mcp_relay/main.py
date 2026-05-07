@@ -611,6 +611,79 @@ GATEWAY_RESOURCES: list[dict[str, Any]] = [
 ]
 
 
+def _detect_sub_servers(
+    server_name: str, tools: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Group tools by their first ``__`` segment to surface
+    relay-of-relay topologies in the capability snapshot.
+
+    When this relay federates an upstream that is itself an
+    aggregator (e.g. ``alloy`` upstream that exposes 553 tools whose
+    local names already follow ``<sub-server>__<tool>``), the flat
+    sample of 10 tool names is alphabetically clustered and hides
+    most of the sub-servers behind the first one. The agent reading
+    capabilities sees "alloy: 553 tools, sample [alloy-mcp__*, ...]"
+    and never learns that ``docs-mcp``, ``komodo-mcp``,
+    ``bayes-mcp`` etc. are also reachable through that same path.
+
+    Heuristic: if there are 2+ distinct buckets (counting tools with
+    no ``__`` as one bucket and each ``<prefix>__`` group as its own
+    bucket), return a per-bucket breakdown with count, full
+    invocation prefix, and a small alphabetical sample.
+
+    Tools with no ``__`` in their name are bucketed under the
+    sentinel prefix ``""`` (empty string). For purely flat servers
+    (no ``__`` anywhere) and purely single-prefix servers (every
+    tool shares the same prefix), this returns an empty list and
+    the caller skips the ``sub_servers`` field — neither case adds
+    information beyond the flat ``sample_tools`` list. Mixed
+    surfaces (some prefixed, some not) DO get the breakdown so the
+    agent learns both shapes coexist.
+
+    The ``tool_prefix`` on each sub-entry is the relay-side
+    invocation prefix: ``<server>__<sub-prefix>__``. An agent can
+    pass ``execute_tool(tool_id="<server>__<sub-prefix>__<sample>", ...)``
+    directly without re-deriving the chain.
+    """
+    groups: dict[str, list[str]] = {}
+    for t in tools:
+        name = t.get("name", "")
+        if not name:
+            continue
+        if "__" in name:
+            prefix, _, _ = name.partition("__")
+        else:
+            prefix = ""
+        groups.setdefault(prefix, []).append(name)
+
+    # Fewer than 2 distinct buckets → flat or single-prefix surface;
+    # the breakdown adds no information over the flat sample_tools.
+    if len(groups) < 2:
+        return []
+
+    out: list[dict[str, Any]] = []
+    for prefix in sorted(groups):
+        names = sorted(groups[prefix])
+        # Strip the leading ``<prefix>__`` from the sample so the
+        # agent sees the *local* tool name on each sub-server. The
+        # full invocation form is reconstructable from tool_prefix.
+        if prefix:
+            local_samples = [n[len(prefix) + 2 :] for n in names[:5]]
+            tool_prefix = f"{server_name}__{prefix}__"
+        else:
+            local_samples = names[:5]
+            tool_prefix = f"{server_name}__"
+        out.append(
+            {
+                "prefix": prefix,
+                "tool_count": len(names),
+                "tool_prefix": tool_prefix,
+                "sample_tools": local_samples,
+            }
+        )
+    return out
+
+
 async def _build_capabilities_resource() -> dict[str, Any]:
     """Build the ``gateway://capabilities`` resource body.
 
@@ -661,16 +734,18 @@ async def _build_capabilities_resource() -> dict[str, Any]:
             else ServerStatus.UNKNOWN.value
         )
         description = srv_row.get("description") if srv_row else None
-        servers_info.append(
-            {
-                "server": srv_name,
-                "status": status,
-                "description": description,
-                "tool_count": len(visible),
-                "sample_tools": sample,
-                "tool_prefix": f"{srv_name}__",
-            }
-        )
+        entry: dict[str, Any] = {
+            "server": srv_name,
+            "status": status,
+            "description": description,
+            "tool_count": len(visible),
+            "sample_tools": sample,
+            "tool_prefix": f"{srv_name}__",
+        }
+        sub_servers = _detect_sub_servers(srv_name, visible)
+        if sub_servers:
+            entry["sub_servers"] = sub_servers
+        servers_info.append(entry)
 
     return {
         "schema": "mcp-relay/capabilities/v1",
@@ -683,8 +758,12 @@ async def _build_capabilities_resource() -> dict[str, Any]:
         "hint": (
             "Each tool can be invoked via execute_tool with tool_id "
             "'<server>__<tool>' (or via the MCP tools/call method "
-            "using the same prefixed name). For semantic search across "
-            "this catalog, use the discover_tools tool."
+            "using the same prefixed name). When a server entry has a "
+            "'sub_servers' field, this gateway is federating another "
+            "aggregator and tool names follow "
+            "'<server>__<sub-prefix>__<tool>' — use the sub-server's "
+            "tool_prefix to construct the invocation. For semantic "
+            "search across this catalog, use the discover_tools tool."
         ),
     }
 
