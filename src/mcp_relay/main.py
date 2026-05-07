@@ -29,6 +29,8 @@ from mcp_relay.models import (
     MCPServerCreate,
     MCPServerUpdate,
     MCPTool,
+    Resource,
+    ResourceListResponse,
     ServerHealth,
     ServerStatus,
     TransportType,
@@ -571,6 +573,186 @@ async def execute_tool(request: Request):
 
 
 # =============================================================================
+# Resources API
+# =============================================================================
+#
+# Resources are MCP's read-only counterpart to tools — capability
+# catalogs, structure overviews, status pages — that an agent reads
+# on demand for context. They solve the "discover_tools paraphrase
+# spiral" problem: instead of guessing at queries to enumerate what's
+# available, an agent reads one URI and gets a structured snapshot.
+#
+# This relay synthesizes ``gateway://capabilities`` from its own
+# registered servers + tool cache. Future work: aggregate
+# ``resources/list`` from upstream MCP servers and expose them through
+# the same endpoints (mirrors how /api/tools aggregates from upstreams).
+
+
+GATEWAY_RESOURCE_OWNER = "gateway"
+
+# Resources synthesized by the relay itself (not aggregated from
+# upstream MCP servers). Add new entries here when the relay should
+# expose additional read-only context. Keep descriptions concrete:
+# agents pick which Resource to read from these strings, so vague
+# wording wastes a discovery round-trip.
+GATEWAY_RESOURCES: list[dict[str, Any]] = [
+    {
+        "uri": "gateway://capabilities",
+        "name": "Gateway capability catalog",
+        "description": (
+            "Snapshot of every registered upstream MCP server, its "
+            "health, tool count, and a sample of tool names. Reading "
+            "this once tells an agent what tools exist and how to "
+            "invoke them — no semantic search needed. Refreshed on "
+            "every read from the live tool cache."
+        ),
+        "mimeType": "application/json",
+    },
+]
+
+
+async def _build_capabilities_resource() -> dict[str, Any]:
+    """Build the ``gateway://capabilities`` resource body.
+
+    Returns a structured snapshot of the gateway's tool surface:
+    one entry per registered server, with status, tool count, a
+    deterministic sample of tool names (alphabetical), and the
+    invocation prefix. Per-server allow/block lists are applied so
+    agents only see invokable tools.
+
+    Iteration is anchored on ``db.list_servers`` (registered set) —
+    not the tool cache — so a registered server that has not yet
+    been probed, or whose discovery returned zero tools, still
+    appears in the snapshot. Hiding such servers would silently
+    under-report the surface and make ``summary.total_servers``
+    drift from ``/api/servers``.
+
+    Concurrency: the tool cache is snapshotted under ``cache_lock``
+    once at entry; all subsequent DB I/O happens after the lock is
+    released. Holding ``cache_lock`` across awaited DB calls would
+    serialize unrelated tool execution and refresh paths against
+    every capability read.
+    """
+    async with cache_lock:
+        cache_snapshot: dict[str, list[dict[str, Any]]] = {
+            name: list(tools) for name, tools in tool_cache.items()
+        }
+
+    registered = await db.list_servers()
+    # Union of registered + cached server names so an in-flight cache
+    # entry whose DB row hasn't landed yet (or vice versa) still shows
+    # up. Sorted alphabetically for deterministic output.
+    registered_by_name = {row["name"]: row for row in registered}
+    all_names = sorted(set(registered_by_name) | set(cache_snapshot))
+
+    servers_info: list[dict[str, Any]] = []
+    for srv_name in all_names:
+        tools = cache_snapshot.get(srv_name, [])
+        allow, block = await _server_filters(srv_name)
+        visible = sorted(
+            (t for t in tools if _is_tool_allowed(t["name"], allow, block)),
+            key=lambda t: t["name"],
+        )
+        sample = [t["name"] for t in visible[:10]]
+        srv_row = registered_by_name.get(srv_name)
+        status = (
+            srv_row.get("status", ServerStatus.UNKNOWN.value)
+            if srv_row
+            else ServerStatus.UNKNOWN.value
+        )
+        description = srv_row.get("description") if srv_row else None
+        servers_info.append(
+            {
+                "server": srv_name,
+                "status": status,
+                "description": description,
+                "tool_count": len(visible),
+                "sample_tools": sample,
+                "tool_prefix": f"{srv_name}__",
+            }
+        )
+
+    return {
+        "schema": "mcp-relay/capabilities/v1",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "summary": {
+            "total_servers": len(servers_info),
+            "total_tools": sum(s["tool_count"] for s in servers_info),
+        },
+        "servers": servers_info,
+        "hint": (
+            "Each tool can be invoked via execute_tool with tool_id "
+            "'<server>__<tool>' (or via the MCP tools/call method "
+            "using the same prefixed name). For semantic search across "
+            "this catalog, use the discover_tools tool."
+        ),
+    }
+
+
+async def _read_gateway_resource(uri: str) -> Optional[dict[str, Any]]:
+    """Resolve and read a relay-synthesized resource. Returns the
+    MCP-shaped contents-list payload, or None if the URI is not one
+    we own."""
+    if uri == "gateway://capabilities":
+        body = await _build_capabilities_resource()
+        return {
+            "uri": uri,
+            "mimeType": "application/json",
+            "text": json.dumps(body, indent=2),
+        }
+    return None
+
+
+@app.get("/api/resources", response_model=ResourceListResponse)
+async def list_resources_endpoint():
+    """List all Resources exposed by this gateway.
+
+    Currently returns only relay-synthesized resources (e.g.
+    ``gateway://capabilities``). Aggregation of upstream MCP server
+    resources is a follow-up: most upstream servers today are
+    tools-only, so the aggregation would return empty for them.
+    """
+    out = [
+        Resource(server=GATEWAY_RESOURCE_OWNER, **r)
+        for r in GATEWAY_RESOURCES
+    ]
+    return ResourceListResponse(resources=out)
+
+
+@app.post("/api/resources/read")
+async def read_resource_endpoint(request: Request):
+    """Read a Resource by URI.
+
+    Request body:
+        uri: Resource URI from /api/resources (e.g. 'gateway://capabilities').
+        server: Optional explicit server name. Currently unused — URI
+            scheme alone is sufficient to route. Kept for API
+            stability when upstream-aggregated resources land.
+
+    Returns:
+        uri: Echo of the requested URI.
+        server: Owning server name.
+        contents: List of content chunks in MCP shape: each item has
+            ``uri``, ``mimeType``, and either ``text`` or ``blob``.
+    """
+    body = await request.json()
+    uri = (body.get("uri") or "").strip()
+    if not uri:
+        raise HTTPException(status_code=400, detail="uri is required")
+
+    content = await _read_gateway_resource(uri)
+    if content is not None:
+        return {
+            "uri": uri,
+            "server": GATEWAY_RESOURCE_OWNER,
+            "contents": [content],
+        }
+
+    # Future: try to route to an upstream MCP server's resources/read.
+    raise HTTPException(status_code=404, detail=f"Resource not found: {uri}")
+
+
+# =============================================================================
 # MCP Protocol Endpoints (full MCP SSE transport for Claude Code etc.)
 # =============================================================================
 
@@ -601,18 +783,30 @@ async def _handle_mcp_request(
 ) -> dict[str, Any]:
     """Handle an MCP JSON-RPC request and return response."""
     method = request_data.get("method", "")
-    params = request_data.get("params", {})
+    # JSON-RPC ``params`` is optional. Clients may omit the key
+    # entirely (``.get`` returns the default) OR send it as explicit
+    # null (``.get`` returns ``None``). Both must collapse to {} so
+    # downstream ``params.get(...)`` never hits ``None.get``.
+    params = request_data.get("params") or {}
     request_id = request_data.get("id")
 
     logger.debug(f"MCP request: method={method}, id={request_id}")
 
     try:
         if method == "initialize":
-            # Return server capabilities
+            # Return server capabilities. ``resources.subscribe`` is
+            # false because the relay does not push change notifications.
+            # ``resources.listChanged`` is false because the *list* of
+            # resource URIs is static — currently just
+            # ``gateway://capabilities``. The *content* of that one
+            # resource is dynamic (it reflects live server registry +
+            # tool cache), but listChanged signals additions/removals
+            # of resources, not content drift, so false is correct.
             result = {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {
                     "tools": {"listChanged": False},
+                    "resources": {"subscribe": False, "listChanged": False},
                 },
                 "serverInfo": {
                     "name": "relay-mcp",
@@ -665,6 +859,26 @@ async def _handle_mcp_request(
 
             tool_result = await execute_tool_on_server(server, actual_tool, arguments)
             result = tool_result
+        elif method == "resources/list":
+            # MCP spec: returns {"resources": [...]} with the same
+            # shape as the tools/list response. Field names here use
+            # the spec's camelCase (``mimeType``) — the Pydantic model
+            # serializes by alias for that.
+            resources = [
+                Resource(server=GATEWAY_RESOURCE_OWNER, **r).model_dump(
+                    by_alias=True, exclude_none=True
+                )
+                for r in GATEWAY_RESOURCES
+            ]
+            result = {"resources": resources}
+        elif method == "resources/read":
+            uri = (params.get("uri") or "").strip()
+            if not uri:
+                raise ValueError("uri is required")
+            content = await _read_gateway_resource(uri)
+            if content is None:
+                raise ValueError(f"Resource not found: {uri}")
+            result = {"contents": [content]}
         elif method == "ping":
             result = {}
         else:

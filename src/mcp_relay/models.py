@@ -176,3 +176,40 @@ class AggregatorStats(BaseModel):
     healthy_servers: int
     total_tools: int
     servers: list[MCPServer]
+
+
+class Resource(BaseModel):
+    """An MCP Resource — read-only context exposed by a server.
+
+    Resources let an agent pull a snapshot of state (capability
+    catalogs, structure overviews, status pages) without invoking
+    a tool. Addressed by URI, with the URI scheme typically matching
+    the owning server. Field names match the MCP spec
+    (resources/list response items) so this model is usable in both
+    the HTTP API and the MCP-protocol path without remapping.
+    """
+
+    uri: str = Field(..., description="Resource URI (e.g. 'gateway://capabilities')")
+    name: str = Field(..., description="Human-readable name")
+    description: Optional[str] = Field(None, description="What this resource exposes")
+    mime_type: str = Field(
+        default="application/json",
+        alias="mimeType",
+        description="MIME type of the resource content",
+    )
+    server: str = Field(
+        ...,
+        description=(
+            "Server that owns this resource. 'gateway' for relay-synthesized "
+            "resources (e.g. capability catalog); otherwise the registered "
+            "upstream MCP server name."
+        ),
+    )
+
+    model_config = {"populate_by_name": True}
+
+
+class ResourceListResponse(BaseModel):
+    """Response shape for GET /api/resources."""
+
+    resources: list[Resource]
