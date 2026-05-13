@@ -38,16 +38,26 @@ class EvaluateResponse(BaseModel):
 
 
 class PolicyDenied(Exception):
-    """Raised when a configured policy rejects a tool call.
+    """Raised when a tool call is rejected by policy.
 
-    Carries the reasons returned by the backend so callers can pass
-    them to clients in error responses. Reasons are opaque slugs —
-    callers should not try to parse them for semantic meaning beyond
-    distinguishing one rejection from another.
+    Accepts either a plain string message (legacy callers — e.g. the
+    per-server allow/block-list check) or a structured ``reasons``
+    list with an optional ``audit_id`` (content-policy middleware).
+    Both forms surface ``.reasons`` for the JSON-RPC error mapper.
+
+    Mapped to JSON-RPC error code :data:`JSONRPC_POLICY_DENIED_CODE`
+    (server-defined, in the implementation-defined -32000..-32099
+    range per JSON-RPC 2.0 §5.1) so MCP clients can distinguish a
+    policy denial from a generic internal error.
     """
 
-    def __init__(self, reasons: list[str], audit_id: Optional[UUID] = None):
-        self.reasons = reasons
+    def __init__(self, reasons=None, audit_id: Optional[UUID] = None):
+        if isinstance(reasons, str):
+            self.reasons = [reasons]
+        elif reasons is None:
+            self.reasons = []
+        else:
+            self.reasons = list(reasons)
         self.audit_id = audit_id
         super().__init__(self._format())
 
@@ -55,3 +65,9 @@ class PolicyDenied(Exception):
         if not self.reasons:
             return "rejected by policy"
         return f"rejected by policy: {', '.join(self.reasons)}"
+
+
+# JSON-RPC error code for "tool blocked by policy". Implementation-
+# defined per JSON-RPC 2.0 §5.1 (servers may use any code in the
+# -32000..-32099 range).
+JSONRPC_POLICY_DENIED_CODE = -32001

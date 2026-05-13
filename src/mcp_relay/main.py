@@ -35,6 +35,13 @@ from mcp_relay.models import (
     ServerStatus,
     TransportType,
 )
+from mcp_relay.policy import (
+    JSONRPC_POLICY_DENIED_CODE,
+    PolicyClient,
+    PolicyDenied,
+    build_policy_client,
+)
+from mcp_relay.policy.middleware import enforce_policy
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,6 +54,7 @@ db: Optional[Database] = None
 tool_cache: dict[str, list[dict]] = {}  # server_name -> tools
 cache_lock = asyncio.Lock()
 discovery_service: Optional[DiscoveryService] = None
+policy_client: Optional[PolicyClient] = None  # set during lifespan startup
 
 # MCP SSE session management
 mcp_sessions: dict[UUID, "MCPSession"] = {}
@@ -123,13 +131,20 @@ def init_telemetry():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan - startup and shutdown."""
-    global db, discovery_service, canary_task
+    global db, discovery_service, canary_task, policy_client
     db = Database()
     await db.connect()
     await db.init_schema()
 
     # Initialize discovery service (loads sentence transformer model)
     discovery_service = DiscoveryService()
+
+    # Content-policy client (no-op by default; opt-in via POLICY_BACKEND env).
+    # Constructed once at startup; the same instance handles every tool call.
+    policy_client = build_policy_client()
+    logger.info(
+        f"policy client: {type(policy_client).__name__}"
+    )
 
     # Initial tool discovery with retry (servers may not be ready immediately)
     asyncio.create_task(refresh_all_tools(retry_on_empty=True, max_retries=5))
@@ -936,6 +951,17 @@ async def _handle_mcp_request(
                     "not in this server's allowlist or is blocked"
                 )
 
+            # Content-policy middleware. No-op unless POLICY_BACKEND is
+            # configured. On reject, raises PolicyDenied (mapped to the
+            # JSON-RPC policy-denied error code by the outer handler).
+            # On redact, returns substituted arguments to forward.
+            if policy_client is not None:
+                arguments = await enforce_policy(
+                    policy_client,
+                    tool_name=f"{server_name}__{actual_tool}",
+                    arguments=arguments,
+                )
+
             tool_result = await execute_tool_on_server(server, actual_tool, arguments)
             result = tool_result
         elif method == "resources/list":
@@ -1139,6 +1165,21 @@ async def call_tool(request: Request):
             ),
         )
 
+    # Content-policy middleware. No-op unless POLICY_BACKEND is
+    # configured. PolicyDenied surfaces as HTTP 403 parallel to the
+    # allow/block-list rejection above. Detail is the formatted
+    # message only; structured reasons stay in the policy server's
+    # audit log, which is the authoritative place to inspect them.
+    if policy_client is not None:
+        try:
+            arguments = await enforce_policy(
+                policy_client,
+                tool_name=f"{server_name}__{actual_tool}",
+                arguments=arguments,
+            )
+        except PolicyDenied as e:
+            raise HTTPException(status_code=403, detail=str(e))
+
     # Call the tool on the target server
     result = await execute_tool_on_server(server, actual_tool, arguments)
     return result
@@ -1301,19 +1342,6 @@ def _build_auth_headers(auth_config: Optional[dict]) -> dict[str, str]:
             headers[header_name] = header_value
 
     return headers
-
-
-class PolicyDenied(Exception):
-    """Raised when a tool call is rejected by per-server allow/block
-    list policy. Mapped to JSON-RPC error code -32001 (server-defined,
-    in the implementation-defined -32000..-32099 range) so MCP clients
-    can distinguish a policy denial from a generic internal error."""
-
-
-# JSON-RPC error code for "tool blocked by policy". Implementation-
-# defined per JSON-RPC 2.0 §5.1 (servers may use any code in the
-# -32000..-32099 range).
-JSONRPC_POLICY_DENIED_CODE = -32001
 
 
 def _parse_tool_list(raw: Any) -> Optional[list[str]]:

@@ -29,13 +29,20 @@ from .client import (
     PolicyClientError,
     build_policy_client,
 )
-from .models import Decision, EvaluateRequest, EvaluateResponse, PolicyDenied
+from .models import (
+    Decision,
+    EvaluateRequest,
+    EvaluateResponse,
+    JSONRPC_POLICY_DENIED_CODE,
+    PolicyDenied,
+)
 
 __all__ = [
     "Decision",
     "EvaluateRequest",
     "EvaluateResponse",
     "HttpPolicyClient",
+    "JSONRPC_POLICY_DENIED_CODE",
     "NoopPolicy",
     "PolicyClient",
     "PolicyClientError",
