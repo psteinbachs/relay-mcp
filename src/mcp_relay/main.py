@@ -553,10 +553,27 @@ async def execute_tool(request: Request):
     Request body:
         tool_id: Tool ID in format "server__tool"
         arguments: Tool arguments dict
+        _meta:    Optional MCP ``_meta`` request-params field. The
+                  MCP protocol reserves ``_meta`` for private
+                  extensions (reverse-DNS namespaced keys — auth
+                  identity, trace ids, etc.). The relay treats it as
+                  opaque passthrough and forwards it verbatim into
+                  the CallTool request to the upstream server. Reject
+                  non-object values (a JSON null collapses to "no
+                  meta"; everything else is a contract error from
+                  the caller, surfaced loudly rather than silently
+                  dropped — silent-drop hides bugs in identity-
+                  forwarding code paths).
     """
     body = await request.json()
     tool_id = body.get("tool_id", "")
     arguments = body.get("arguments", {})
+    meta = body.get("_meta")
+    if meta is not None and not isinstance(meta, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="_meta must be an object (or omitted/null)",
+        )
 
     if "__" not in tool_id:
         raise HTTPException(
@@ -580,7 +597,7 @@ async def execute_tool(request: Request):
         )
 
     try:
-        result = await execute_tool_on_server(server, tool_name, arguments)
+        result = await execute_tool_on_server(server, tool_name, arguments, meta=meta)
         return {"result": result}
     except Exception as e:
         logger.error(f"Tool execution failed: {tool_id}: {e}")
@@ -919,6 +936,14 @@ async def _handle_mcp_request(
             # Execute a tool
             tool_name = params.get("name", "")
             arguments = params.get("arguments", {})
+            # MCP spec: ``_meta`` is reserved as a loose object on
+            # request params for private extensions. Pass it through
+            # to the upstream server verbatim — interpretation is the
+            # upstream's job, not the relay's. Reject non-object so
+            # contract bugs surface loudly.
+            meta = params.get("_meta")
+            if meta is not None and not isinstance(meta, dict):
+                raise ValueError("_meta must be an object (or omitted/null)")
 
             if "__" in tool_name:
                 server_name, actual_tool = tool_name.split("__", 1)
@@ -962,7 +987,7 @@ async def _handle_mcp_request(
                     arguments=arguments,
                 )
 
-            tool_result = await execute_tool_on_server(server, actual_tool, arguments)
+            tool_result = await execute_tool_on_server(server, actual_tool, arguments, meta=meta)
             result = tool_result
         elif method == "resources/list":
             # MCP spec: returns {"resources": [...]} with the same
@@ -1122,10 +1147,21 @@ async def mcp_message_endpoint(request: Request, session_id: str = Query(...)):
 
 @app.post("/mcp/tools/call")
 async def call_tool(request: Request):
-    """Proxy a tool call to the appropriate server (legacy endpoint)."""
+    """Proxy a tool call to the appropriate server (legacy endpoint).
+
+    Accepts an optional MCP ``_meta`` field alongside ``name`` /
+    ``arguments`` and forwards it verbatim to the upstream CallTool.
+    See ``/api/proxy/execute`` for the contract — same semantics.
+    """
     body = await request.json()
     tool_name = body.get("name", "")
     arguments = body.get("arguments", {})
+    meta = body.get("_meta")
+    if meta is not None and not isinstance(meta, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="_meta must be an object (or omitted/null)",
+        )
 
     # Parse server__tool format or auto-lookup
     if "__" in tool_name:
@@ -1181,7 +1217,7 @@ async def call_tool(request: Request):
             raise HTTPException(status_code=403, detail=str(e))
 
     # Call the tool on the target server
-    result = await execute_tool_on_server(server, actual_tool, arguments)
+    result = await execute_tool_on_server(server, actual_tool, arguments, meta=meta)
     return result
 
 
@@ -1646,8 +1682,22 @@ def _normalize_arguments(arguments: dict) -> dict:
     return arguments
 
 
-async def execute_tool_on_server(server: dict, tool_name: str, arguments: dict) -> dict:
-    """Execute a tool on a specific server."""
+async def execute_tool_on_server(
+    server: dict,
+    tool_name: str,
+    arguments: dict,
+    meta: dict | None = None,
+) -> dict:
+    """Execute a tool on a specific server.
+
+    ``meta`` is the optional MCP ``_meta`` request-params field. The
+    MCP protocol reserves it as a loose object for private extensions
+    (reverse-DNS namespaced keys) — auth identity, trace ids, etc.
+    The relay treats it as opaque passthrough: it goes verbatim into
+    the CallTool request and is the upstream server's responsibility
+    to interpret. ``None`` means "don't send a ``_meta`` field" (the
+    MCP SDK's call_tool default).
+    """
     url = server["url"]
     transport = server.get("transport", "sse")
     auth_config = _parse_auth_config(server.get("auth_config"))
@@ -1659,7 +1709,7 @@ async def execute_tool_on_server(server: dict, tool_name: str, arguments: dict) 
         async with sse_client(url) as (read_stream, write_stream):
             async with ClientSession(read_stream, write_stream) as session:
                 await session.initialize()
-                result = await session.call_tool(tool_name, arguments)
+                result = await session.call_tool(tool_name, arguments, meta=meta)
                 # exclude_none=True strips 'annotations: null' which violates MCP spec
                 return {
                     "content": [c.model_dump(exclude_none=True) for c in result.content]
@@ -1673,7 +1723,7 @@ async def execute_tool_on_server(server: dict, tool_name: str, arguments: dict) 
         ):
             async with ClientSession(read_stream, write_stream) as session:
                 await session.initialize()
-                result = await session.call_tool(tool_name, arguments)
+                result = await session.call_tool(tool_name, arguments, meta=meta)
                 # exclude_none=True strips 'annotations: null' which violates MCP spec
                 return {
                     "content": [c.model_dump(exclude_none=True) for c in result.content]
