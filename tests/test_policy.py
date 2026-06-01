@@ -285,3 +285,37 @@ async def test_enforce_fail_open_when_configured(monkeypatch):
         FailingClient(), tool_name="x", arguments=args
     )
     assert result == args
+
+
+# --- span observability -----------------------------------------------------
+
+
+async def test_enforce_records_decision_on_span():
+    """The gate annotates the active span so it's auditable in traces."""
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test")
+
+    class PassClient:
+        async def evaluate(self, req):
+            return EvaluateResponse(
+                decision=Decision.PASS, reasons=["local:allow"], policy_matched=True
+            )
+
+    with tracer.start_as_current_span("tools/call"):
+        await enforce_policy(
+            PassClient(), tool_name="infra-mcp__do", arguments={"id": "1"}
+        )
+
+    (span,) = exporter.get_finished_spans()
+    assert span.attributes["policy.tool"] == "infra-mcp__do"
+    assert span.attributes["policy.decision"] == "pass"
+    assert span.attributes["policy.matched"] is True
+    assert span.attributes["policy.reasons"] == "local:allow"

@@ -35,10 +35,11 @@ fields to the configured backend and acts on the returned decision.
 
 | Environment variable | Default | Purpose |
 |---|---|---|
-| `POLICY_BACKEND` | `noop` | `noop` / `http` |
+| `POLICY_BACKEND` | `noop` | `noop` / `http` / `local` |
 | `POLICY_API_URL` | — | HTTP backend base URL (required for `http`) |
 | `POLICY_API_TOKEN` | — | Bearer token (required for `http`) |
-| `POLICY_TIMEOUT_SECONDS` | `5.0` | Request timeout |
+| `POLICY_RULES_FILE` | — | Path to the rule set (required for `local`) |
+| `POLICY_TIMEOUT_SECONDS` | `5.0` | Request timeout (`http` only) |
 | `POLICY_FAIL_OPEN` | `false` | If `true`, transient backend errors pass; default fails closed |
 
 ## Wire protocol
@@ -137,9 +138,62 @@ further on the policy-server side.
   forward a trace id via the `x-trace-id` header (or any header you
   pass through to `trace_id`).
 
+## Local rules backend
+
+`POLICY_BACKEND=local` evaluates calls against a rule file
+(`POLICY_RULES_FILE`, YAML or JSON) entirely in-process — no external
+service. It suits a single-tenant gateway that wants to constrain
+*which resources* a few federated tools may touch (an infra MCP to a
+set of resource ids, a DNS MCP to one zone, a vault MCP to one
+collection) without running a separate policy server.
+
+The rule schema is deployment-agnostic — all concrete values live in
+the file, never in the relay:
+
+```yaml
+# Action when NO rule matches the called tool.
+#   reject -> fail-closed allowlist (enumerate everything you permit)
+#   pass   -> guard mode: constrain a few tools, let the rest through
+#             (typical when the relay also serves benign tools)
+default: pass
+
+rules:
+  - tools: ["infra-mcp__*"]        # fnmatch globs on "<server>__<tool>"
+    require:                       # ALL predicates must hold, else reject
+      resource_id: { in: [10, 11, 12] }
+    reason: "infra-mcp is scoped to the project resources"
+
+  - tools: ["dns-mcp__*"]
+    require:
+      zone: { eq: "example.com" }
+```
+
+Predicates, per field, AND-combined:
+
+| Predicate | Meaning |
+|---|---|
+| `eq` / `ne` | string equality / inequality (values coerced to string) |
+| `in` | membership in a list (values coerced to string) |
+| `matches` | `re.search` against the field value |
+
+Field names match the flattened argument paths the middleware
+produces (`resource_id` or `arguments.resource_id` — either form
+works). A required field that is **absent** from the call fails its
+predicate, so a privileged tool invoked without its scoping argument
+is rejected rather than allowed through.
+
+Pair this with each registration's `tool_allowlist` for defense in
+depth: the allowlist decides *which verbs* a federated server exposes;
+the rules decide *which resources* those verbs may act on.
+
+Validation is eager — `build_policy_client()` raises
+`PolicyClientError` at startup on a missing file, a schema violation,
+or an uncompilable `matches` regex, so a bad rule file fails the relay
+fast instead of at first call.
+
 ## Extending
 
-Subclass `PolicyClient` to implement other strategies (local YAML,
-in-process rules, gRPC backend, etc.). Add a branch to
+Subclass `PolicyClient` to implement other strategies (gRPC backend,
+a different rules format, etc.). Add a branch to
 `build_policy_client()` if your backend should be configurable
 from environment variables.
