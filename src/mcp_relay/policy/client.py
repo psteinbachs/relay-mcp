@@ -132,12 +132,13 @@ def build_policy_client() -> PolicyClient:
 
     Environment variables (all optional; default is no-op):
 
-    - ``POLICY_BACKEND`` — ``noop`` (default), ``http``
+    - ``POLICY_BACKEND`` — ``noop`` (default), ``http``, ``local``
     - ``POLICY_API_URL`` — base URL for ``http`` backend
     - ``POLICY_API_TOKEN`` — bearer token for ``http`` backend
     - ``POLICY_TIMEOUT_SECONDS`` — request timeout (default ``5.0``)
+    - ``POLICY_RULES_FILE`` — path to the rule set for ``local`` backend
 
-    Raises :class:`PolicyClientError` if ``http`` is selected but
+    Raises :class:`PolicyClientError` if a backend is selected but its
     required fields are missing.
     """
     backend = os.getenv("POLICY_BACKEND", "noop").lower()
@@ -152,4 +153,15 @@ def build_policy_client() -> PolicyClient:
             )
         timeout = float(os.getenv("POLICY_TIMEOUT_SECONDS", "5.0"))
         return HttpPolicyClient(base_url=url, token=token, timeout=timeout)
+    if backend == "local":
+        # Imported lazily: local.py imports this module for the base
+        # class, so a top-level import would be circular.
+        from .local import LocalRulesPolicy
+
+        path = os.getenv("POLICY_RULES_FILE", "").strip()
+        if not path:
+            raise PolicyClientError(
+                "POLICY_BACKEND=local requires POLICY_RULES_FILE"
+            )
+        return LocalRulesPolicy.from_file(path)
     raise PolicyClientError(f"unknown POLICY_BACKEND: {backend!r}")

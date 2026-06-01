@@ -16,10 +16,11 @@ Backends shipped:
 - :class:`~mcp_relay.policy.client.NoopPolicy` (default)
 - :class:`~mcp_relay.policy.client.HttpPolicyClient` (calls a remote
   policy service)
+- :class:`~mcp_relay.policy.local.LocalRulesPolicy` (in-process rules
+  from a config file; no external service)
 
 Third parties can subclass :class:`~mcp_relay.policy.client.PolicyClient`
-to implement local-YAML, in-process, or other strategies without
-forking the relay.
+to implement other strategies without forking the relay.
 """
 
 from .client import (
@@ -29,6 +30,7 @@ from .client import (
     PolicyClientError,
     build_policy_client,
 )
+from .local import LocalRulesPolicy, RuleSet, load_ruleset
 from .models import (
     Decision,
     EvaluateRequest,
@@ -43,9 +45,12 @@ __all__ = [
     "EvaluateResponse",
     "HttpPolicyClient",
     "JSONRPC_POLICY_DENIED_CODE",
+    "LocalRulesPolicy",
     "NoopPolicy",
     "PolicyClient",
     "PolicyClientError",
     "PolicyDenied",
+    "RuleSet",
     "build_policy_client",
+    "load_ruleset",
 ]

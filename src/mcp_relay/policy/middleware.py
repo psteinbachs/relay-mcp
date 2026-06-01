@@ -37,6 +37,8 @@ import os
 from typing import Any
 from uuid import UUID
 
+from opentelemetry import trace
+
 from .client import PolicyClient, PolicyClientError
 from .models import Decision, EvaluateRequest, EvaluateResponse, PolicyDenied
 
@@ -45,6 +47,29 @@ logger = logging.getLogger("relay-mcp.policy")
 
 def _policy_fail_open() -> bool:
     return os.getenv("POLICY_FAIL_OPEN", "false").lower() in ("true", "1", "yes")
+
+
+def _record_decision(
+    tool_name: str,
+    decision: str,
+    *,
+    policy_matched: bool,
+    reasons: list[str] | None = None,
+) -> None:
+    """Annotate the current span so the gate is auditable in traces.
+
+    Backend-agnostic and cheap: on a non-recording span every call is
+    a no-op. ``decision`` distinguishes ``pass`` / ``reject`` /
+    ``redact`` / ``fail_open`` / ``fail_closed``, and ``policy_matched``
+    separates an explicit rule allow from an implicit default-pass — so
+    an operator can confirm the gate ran and slice allows by origin.
+    """
+    span = trace.get_current_span()
+    span.set_attribute("policy.tool", tool_name)
+    span.set_attribute("policy.decision", decision)
+    span.set_attribute("policy.matched", policy_matched)
+    if reasons:
+        span.set_attribute("policy.reasons", ",".join(reasons))
 
 
 def _flatten_for_evaluation(arguments: dict[str, Any]) -> dict[str, str]:
@@ -111,17 +136,29 @@ async def enforce_policy(
             logger.warning(
                 f"policy backend error for {tool_name}, failing open: {e}"
             )
+            _record_decision(tool_name, "fail_open", policy_matched=False)
             return arguments
         logger.error(f"policy backend error for {tool_name}, failing closed: {e}")
+        _record_decision(tool_name, "fail_closed", policy_matched=False)
         raise PolicyDenied(reasons=["fail_closed:policy_backend_unavailable"])
 
     if resp.decision is Decision.PASS:
+        _record_decision(
+            tool_name, "pass", policy_matched=resp.policy_matched, reasons=resp.reasons
+        )
         return arguments
     if resp.decision is Decision.REJECT:
+        _record_decision(
+            tool_name, "reject", policy_matched=resp.policy_matched, reasons=resp.reasons
+        )
         raise PolicyDenied(reasons=resp.reasons, audit_id=resp.audit_id)
     if resp.decision is Decision.REDACT:
+        _record_decision(
+            tool_name, "redact", policy_matched=resp.policy_matched, reasons=resp.reasons
+        )
         return _apply_redactions(arguments, resp.redacted_fields or {})
     # Unknown decision — fail closed
+    _record_decision(tool_name, "fail_closed", policy_matched=False)
     raise PolicyDenied(reasons=[f"unknown_decision:{resp.decision}"])
 
 
