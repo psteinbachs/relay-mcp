@@ -42,6 +42,12 @@ from mcp_relay.policy import (
     build_policy_client,
 )
 from mcp_relay.policy.middleware import enforce_policy
+from mcp_relay.principals import (
+    Principal,
+    PrincipalRegistry,
+    build_principal_registry,
+)
+from opentelemetry import trace
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,6 +61,7 @@ tool_cache: dict[str, list[dict]] = {}  # server_name -> tools
 cache_lock = asyncio.Lock()
 discovery_service: Optional[DiscoveryService] = None
 policy_client: Optional[PolicyClient] = None  # set during lifespan startup
+principal_registry: Optional[PrincipalRegistry] = None  # set during lifespan
 
 # MCP SSE session management
 mcp_sessions: dict[UUID, "MCPSession"] = {}
@@ -131,7 +138,7 @@ def init_telemetry():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan - startup and shutdown."""
-    global db, discovery_service, canary_task, policy_client
+    global db, discovery_service, canary_task, policy_client, principal_registry
     db = Database()
     await db.connect()
     await db.init_schema()
@@ -144,6 +151,14 @@ async def lifespan(app: FastAPI):
     policy_client = build_policy_client()
     logger.info(
         f"policy client: {type(policy_client).__name__}"
+    )
+
+    # Principal registry (multi-tenant mode). Empty ⇒ 1:1 mode, no
+    # caller-identity checks. Built once; fails fast on a bad config.
+    principal_registry = build_principal_registry()
+    logger.info(
+        "principals: "
+        + ("enabled (shared mode)" if principal_registry.enabled else "disabled (1:1 mode)")
     )
 
     # Initial tool discovery with retry (servers may not be ready immediately)
@@ -190,8 +205,14 @@ if otel_instrumentor:
 
 @app.get("/health")
 async def health_check():
-    """Basic health check."""
-    return {"status": "healthy", "service": "relay-mcp"}
+    """Basic health check. ``multi_tenant`` reflects whether principals
+    are configured (shared mode) vs the default 1:1 mode — so the posture
+    is verifiable without parsing startup logs."""
+    return {
+        "status": "healthy",
+        "service": "relay-mcp",
+        "multi_tenant": bool(principal_registry and principal_registry.enabled),
+    }
 
 
 @app.get("/api/stats", response_model=AggregatorStats)
@@ -868,13 +889,40 @@ async def read_resource_endpoint(request: Request):
 # =============================================================================
 
 
-async def _get_aggregated_tools() -> list[dict[str, Any]]:
+def _resolve_principal(request: Request) -> Optional[Principal]:
+    """Resolve the caller's principal from the Authorization header.
+
+    Returns None in 1:1 mode (no principals configured). In shared mode
+    this is fail-closed: a missing or unknown bearer token raises
+    HTTPException(401) rather than falling through to the full surface.
+    """
+    if principal_registry is None or not principal_registry.enabled:
+        return None
+    # Robust Bearer parse: tolerate extra whitespace / casing; a header
+    # that isn't exactly "Bearer <token>" yields no token (→ 401).
+    parts = request.headers.get("authorization", "").split()
+    token = parts[1] if len(parts) == 2 and parts[0].lower() == "bearer" else None
+    principal = principal_registry.resolve(token)
+    if principal is None:
+        raise HTTPException(status_code=401, detail="unknown or missing principal token")
+    # Tag the request span so shared-mode traffic is sliceable by tenant
+    # in traces without deep inspection.
+    trace.get_current_span().set_attribute("mcp.principal", principal.id)
+    return principal
+
+
+async def _get_aggregated_tools(
+    principal: Optional[Principal] = None,
+) -> list[dict[str, Any]]:
     """Get all tools from cache in MCP format, with per-server
     allow/block lists applied so MCP clients (e.g. Claude Code) only
-    see invokable tools.
+    see invokable tools. In shared mode, also narrowed to the
+    principal's server surface.
     """
     all_tools = []
     for srv_name, tools in tool_cache.items():
+        if principal is not None and not principal.allows_server(srv_name):
+            continue
         allow, block = await _server_filters(srv_name)
         for t in tools:
             if not _is_tool_allowed(t["name"], allow, block):
@@ -890,9 +938,16 @@ async def _get_aggregated_tools() -> list[dict[str, Any]]:
 
 
 async def _handle_mcp_request(
-    session: MCPSession, request_data: dict[str, Any]
+    session: MCPSession,
+    request_data: dict[str, Any],
+    principal: Optional[Principal] = None,
 ) -> dict[str, Any]:
-    """Handle an MCP JSON-RPC request and return response."""
+    """Handle an MCP JSON-RPC request and return response.
+
+    ``principal`` is the resolved caller identity in shared mode (None in
+    1:1 mode); it narrows tools/list + tools/call to the principal's
+    surface and is passed to the policy backend for resource scope.
+    """
     method = request_data.get("method", "")
     # JSON-RPC ``params`` is optional. Clients may omit the key
     # entirely (``.get`` returns the default) OR send it as explicit
@@ -928,9 +983,9 @@ async def _handle_mcp_request(
             # Client acknowledged initialization - no response needed
             return None
         elif method == "tools/list":
-            # Return aggregated tools
+            # Return aggregated tools (narrowed to the principal's surface)
             async with cache_lock:
-                tools = await _get_aggregated_tools()
+                tools = await _get_aggregated_tools(principal)
             result = {"tools": tools}
         elif method == "tools/call":
             # Execute a tool
@@ -976,6 +1031,13 @@ async def _handle_mcp_request(
                     "not in this server's allowlist or is blocked"
                 )
 
+            # Shared mode: the tool must also be in this principal's surface.
+            if principal is not None and not principal.allows_server(server_name):
+                raise PolicyDenied(
+                    f"Server '{server_name}' is not in principal "
+                    f"'{principal.id}' surface"
+                )
+
             # Content-policy middleware. No-op unless POLICY_BACKEND is
             # configured. On reject, raises PolicyDenied (mapped to the
             # JSON-RPC policy-denied error code by the outer handler).
@@ -985,6 +1047,7 @@ async def _handle_mcp_request(
                     policy_client,
                     tool_name=f"{server_name}__{actual_tool}",
                     arguments=arguments,
+                    principal=principal.id if principal else None,
                 )
 
             tool_result = await execute_tool_on_server(server, actual_tool, arguments, meta=meta)
@@ -1129,8 +1192,12 @@ async def mcp_message_endpoint(request: Request, session_id: str = Query(...)):
 
     logger.debug(f"MCP message received: session={session_id}, body={body}")
 
+    # Resolve caller identity (None in 1:1 mode; 401 on unknown token in
+    # shared mode). Auth travels on the JSON-RPC POST in shared mode.
+    principal = _resolve_principal(request)
+
     # Handle the request
-    response = await _handle_mcp_request(session, body)
+    response = await _handle_mcp_request(session, body, principal=principal)
 
     # Send response via SSE stream
     if response is not None:
@@ -1162,6 +1229,9 @@ async def call_tool(request: Request):
             status_code=400,
             detail="_meta must be an object (or omitted/null)",
         )
+
+    # Resolve caller identity (None in 1:1 mode; 401 on unknown token).
+    principal = _resolve_principal(request)
 
     # Parse server__tool format or auto-lookup
     if "__" in tool_name:
@@ -1201,6 +1271,13 @@ async def call_tool(request: Request):
             ),
         )
 
+    # Shared mode: the tool must also be in this principal's surface.
+    if principal is not None and not principal.allows_server(server_name):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Server '{server_name}' is not in principal '{principal.id}' surface",
+        )
+
     # Content-policy middleware. No-op unless POLICY_BACKEND is
     # configured. PolicyDenied surfaces as HTTP 403 parallel to the
     # allow/block-list rejection above. Detail is the formatted
@@ -1212,6 +1289,7 @@ async def call_tool(request: Request):
                 policy_client,
                 tool_name=f"{server_name}__{actual_tool}",
                 arguments=arguments,
+                principal=principal.id if principal else None,
             )
         except PolicyDenied as e:
             raise HTTPException(status_code=403, detail=str(e))

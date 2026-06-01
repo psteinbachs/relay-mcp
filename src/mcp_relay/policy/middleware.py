@@ -113,11 +113,16 @@ async def enforce_policy(
     tool_name: str,
     arguments: dict[str, Any],
     trace_id: str | None = None,
+    principal: str | None = None,
 ) -> dict[str, Any]:
     """Run the policy and return arguments to forward.
 
     Returns the (possibly redacted) arguments dict. Raises
     :class:`PolicyDenied` on reject.
+
+    ``principal`` is the resolved caller identity in multi-tenant mode
+    (None in 1:1 mode); it is passed to the backend so decisions can be
+    scoped per principal, and recorded on the span for audit.
 
     On :class:`PolicyClientError` (network / server failure):
     fails closed by default — raises :class:`PolicyDenied` with a
@@ -128,7 +133,10 @@ async def enforce_policy(
         tool_name=tool_name,
         fields=_flatten_for_evaluation(arguments),
         trace_id=trace_id,
+        principal=principal,
     )
+    if principal is not None:
+        trace.get_current_span().set_attribute("policy.principal", principal)
     try:
         resp = await client.evaluate(req)
     except PolicyClientError as e:
