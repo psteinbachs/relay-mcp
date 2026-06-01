@@ -74,12 +74,20 @@ class FieldPredicate(BaseModel):
 
 
 class Rule(BaseModel):
-    """A guard over the tools matching any of ``tools``."""
+    """A guard over the tools matching any of ``tools``.
+
+    ``principals`` optionally restricts the rule to specific caller
+    identities (multi-tenant mode): the rule applies only when the
+    request's principal is in the list. Omitted ⇒ applies to every
+    principal (and to 1:1 mode, where there is no principal) — so
+    single-tenant rule files are unaffected.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     tools: list[str]
     require: dict[str, FieldPredicate] = Field(default_factory=dict)
+    principals: Optional[list[str]] = None
     reason: Optional[str] = None
 
 
@@ -162,7 +170,8 @@ class LocalRulesPolicy(PolicyClient):
         matched = [
             rule
             for rule in self._ruleset.rules
-            if any(fnmatchcase(req.tool_name, pat) for pat in rule.tools)
+            if (rule.principals is None or req.principal in rule.principals)
+            and any(fnmatchcase(req.tool_name, pat) for pat in rule.tools)
         ]
         if not matched:
             if self._ruleset.default == "pass":

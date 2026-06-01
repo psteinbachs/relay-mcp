@@ -186,6 +186,11 @@ Pair this with each registration's `tool_allowlist` for defense in
 depth: the allowlist decides *which verbs* a federated server exposes;
 the rules decide *which resources* those verbs may act on.
 
+In multi-tenant (shared) mode a rule may also carry a `principals:` list,
+so one rule file expresses per-tenant scope (tenant A's zone vs tenant
+B's). A rule without `principals:` applies to every caller, so
+single-tenant rule files are unchanged. See `docs/multi-tenancy.md`.
+
 Validation is eager — `build_policy_client()` raises
 `PolicyClientError` at startup on a missing file, a schema violation,
 or an uncompilable `matches` regex, so a bad rule file fails the relay

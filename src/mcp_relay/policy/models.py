@@ -27,6 +27,9 @@ class EvaluateRequest(BaseModel):
     tool_name: str
     fields: dict[str, str] = Field(default_factory=dict)
     trace_id: Optional[str] = None
+    # Resolved caller identity in multi-tenant (shared) mode; None in 1:1
+    # mode. Backends may scope decisions per principal.
+    principal: Optional[str] = None
 
 
 class EvaluateResponse(BaseModel):

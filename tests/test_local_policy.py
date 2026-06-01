@@ -22,13 +22,13 @@ def _policy(data: dict) -> LocalRulesPolicy:
     return LocalRulesPolicy(RuleSet.model_validate(data))
 
 
-def _req(tool: str, **fields: str) -> EvaluateRequest:
+def _req(tool: str, principal: str | None = None, **fields: str) -> EvaluateRequest:
     # Mirror the middleware's bare + ``arguments.`` aliasing.
     flat: dict[str, str] = {}
     for k, v in fields.items():
         flat[k] = v
         flat[f"arguments.{k}"] = v
-    return EvaluateRequest(tool_name=tool, fields=flat)
+    return EvaluateRequest(tool_name=tool, fields=flat, principal=principal)
 
 
 # --- default action ---------------------------------------------------------
@@ -192,6 +192,56 @@ async def test_custom_reason_used_on_reject():
     )
     resp = await pol.evaluate(_req("infra-mcp__x", region="us"))
     assert resp.reasons == ["infra-mcp is scoped to eu"]
+
+
+# --- principal-keyed rules (multi-tenant) -----------------------------------
+
+
+async def test_principal_keyed_rule_applies_only_to_that_principal():
+    pol = _policy(
+        {
+            "default": "pass",
+            "rules": [
+                {
+                    "principals": ["tenant-a"],
+                    "tools": ["dns-mcp__*"],
+                    "require": {"zone": {"eq": "a.example"}},
+                }
+            ],
+        }
+    )
+    # tenant-a is guarded by the rule:
+    assert (await pol.evaluate(_req("dns-mcp__set", "tenant-a", zone="a.example"))).decision is Decision.PASS
+    assert (await pol.evaluate(_req("dns-mcp__set", "tenant-a", zone="b.example"))).decision is Decision.REJECT
+    # tenant-b doesn't match the rule's principals selector -> default pass:
+    assert (await pol.evaluate(_req("dns-mcp__set", "tenant-b", zone="b.example"))).decision is Decision.PASS
+
+
+async def test_unkeyed_rule_applies_to_all_principals_and_to_none():
+    pol = _policy(
+        {
+            "default": "pass",
+            "rules": [{"tools": ["infra-mcp__*"], "require": {"region": {"eq": "eu"}}}],
+        }
+    )
+    assert (await pol.evaluate(_req("infra-mcp__x", "tenant-a", region="us"))).decision is Decision.REJECT
+    assert (await pol.evaluate(_req("infra-mcp__x", None, region="us"))).decision is Decision.REJECT
+    assert (await pol.evaluate(_req("infra-mcp__x", "tenant-a", region="eu"))).decision is Decision.PASS
+
+
+async def test_per_tenant_zone_isolation():
+    pol = _policy(
+        {
+            "default": "pass",
+            "rules": [
+                {"principals": ["a"], "tools": ["dns-mcp__*"], "require": {"zone": {"eq": "a.example"}}},
+                {"principals": ["b"], "tools": ["dns-mcp__*"], "require": {"zone": {"eq": "b.example"}}},
+            ],
+        }
+    )
+    assert (await pol.evaluate(_req("dns-mcp__set", "a", zone="a.example"))).decision is Decision.PASS
+    assert (await pol.evaluate(_req("dns-mcp__set", "a", zone="b.example"))).decision is Decision.REJECT
+    assert (await pol.evaluate(_req("dns-mcp__set", "b", zone="b.example"))).decision is Decision.PASS
 
 
 # --- loading + validation ---------------------------------------------------
